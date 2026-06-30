@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from google import genai
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types, errors
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging Configuration
@@ -288,17 +290,14 @@ class NewsletterPromptBuilder:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini Client
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# Gemini Client (Updated to latest google-genai package)
+# Gemini Client (Modern V2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 class GeminiClient:
     """
     Wrapper around the modern google-genai SDK.
     Handles model initialisation, generation, and response validation.
     """
-    _MODEL_ID: str = "gemini-2.5-flash"  # Using the modern model name
+    _MODEL_ID: str = "gemini-2.5-flash" 
 
     def __init__(self, api_key: str) -> None:
         if not api_key or not api_key.strip():
@@ -315,22 +314,25 @@ class GeminiClient:
         logger.info("Sending request to modern Gemini API — please wait...")
 
         try:
-            # Modern generation call
+            # Modern generation call using types.GenerateContentConfig
             response = self._client.models.generate_content(
                 model=self._MODEL_ID,
                 contents=prompt,
-                config=genai.types.GenerateContentConfig(
+                config=types.GenerateContentConfig(
                     temperature=0.75,
                     top_p=0.95,
                     max_output_tokens=2048,
                 ) 
             )
-        except Exception as exc:
+        except errors.APIError as exc:
             raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Unexpected error: {exc}") from exc
 
+        # In the new SDK, .text returns None if blocked/empty, it doesn't raise ValueError
         text = response.text
         if not text or not text.strip():
-            raise RuntimeError("Gemini returned an empty text body.")
+            raise RuntimeError("Gemini returned an empty text body. Content may have been blocked.")
 
         logger.info(f"Response received: {len(text):,} chars")
         return text
