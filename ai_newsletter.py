@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════════════╗
 ║           Smart Data Extractor — Phase 2                        ║
 ║           AI-Powered Newsletter Generator                       ║
-║           Model  : gemini-1.5-flash  (Google Generative AI)    ║
+║           Model  : gemini-2.5-flash  (google-genai SDK)        ║
 ║           Input  : output/*.csv  (Phase 1 artifact)            ║
 ║           Output : newsletters/newsletter_<timestamp>.md        ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -15,10 +15,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
 from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types, errors
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging Configuration
@@ -55,8 +56,16 @@ class ArticleSummary:
 # ─────────────────────────────────────────────────────────────────────────────
 class EnvironmentConfig:
     """
-    Loads and validates environment variables from a .env file.
-    Follows the 12-Factor App principle: config lives in the environment.
+    Loads and validates required environment variables with a cloud-first,
+    local-fallback strategy.
+
+    Resolution order (12-Factor App + cloud-platform compatible):
+      1. os.environ — injected by Streamlit Cloud Secrets, Docker, CI/CD, etc.
+      2. .env file  — used for local development only.
+
+    This design guarantees zero-configuration deployment on Streamlit Cloud
+    or any platform that pre-populates os.environ, while remaining ergonomic
+    for local development via a .env file.
     """
 
     _REQUIRED_KEYS: list[str] = ["GEMINI_API_KEY"]
@@ -66,25 +75,54 @@ class EnvironmentConfig:
 
     def load(self) -> dict[str, str]:
         """
-        Reads the .env file, populates os.environ, and validates required keys.
+        Resolves all required keys from environment or .env file and returns
+        a validated config dict.
+
+        Resolution logic:
+          - If ALL required keys are already present in os.environ, the .env
+            file is bypassed entirely (cloud-compatible path).
+          - If any key is missing from os.environ, the .env file is loaded.
+            FileNotFoundError is raised only when the file is genuinely absent
+            AND the key was not found in the environment.
 
         Returns:
-            A dict mapping each required key to its value.
+            A dict mapping each required key to its validated string value.
 
         Raises:
-            FileNotFoundError: If the .env file does not exist.
-            EnvironmentError:  If any required key is absent or empty.
+            FileNotFoundError: If keys are missing from os.environ AND the
+                               .env file does not exist at the expected path.
+            EnvironmentError:  If any required key remains empty after all
+                               resolution attempts.
         """
+        # ── Step 1: Cloud-first check — inspect os.environ before touching disk ──
+        prefilled = {k: os.environ.get(k, "").strip() for k in self._REQUIRED_KEYS}
+        all_present_in_env = all(prefilled.values())
+
+        if all_present_in_env:
+            logger.info(
+                "All required keys detected in os.environ — "
+                "bypassing .env file (cloud-compatible mode active)."
+            )
+            for key in self._REQUIRED_KEYS:
+                logger.info(f"  Key '{key}' confirmed in environment (value masked).")
+            return dict(prefilled)
+
+        # ── Step 2: Local fallback — load .env file ───────────────────────────
         if not self._env_path.exists():
             raise FileNotFoundError(
-                f"'.env' file not found at: {self._env_path.resolve()}\n"
-                "  ➜  Create it and add:  GEMINI_API_KEY=your_key_here\n"
-                "  ➜  Get a free key at:  https://aistudio.google.com/app/apikey"
+                f"GEMINI_API_KEY not found in os.environ, and no .env file exists at:\n"
+                f"  {self._env_path.resolve()}\n\n"
+                "  LOCAL  →  Create a .env file:     echo 'GEMINI_API_KEY=your_key' > .env\n"
+                "  CLOUD  →  Add a Streamlit Secret:  GEMINI_API_KEY = 'your_key'\n"
+                "  KEY    →  Get a free API key at:  https://aistudio.google.com/app/apikey"
             )
 
-        load_dotenv(dotenv_path=self._env_path, override=True)
+        # override=False ensures existing os.environ values (e.g. partial secrets)
+        # are never silently overwritten by a stale .env file.
+        load_dotenv(dotenv_path=self._env_path, override=False)
         logger.info(f"Environment loaded from: {self._env_path.resolve()}")
 
+        # ── Step 3: Validate after merge ──────────────────────────────────────
         config: dict[str, str] = {}
         missing: list[str] = []
 
@@ -94,11 +132,12 @@ class EnvironmentConfig:
                 missing.append(key)
             else:
                 config[key] = value
-                logger.info(f"Config key '{key}' loaded successfully (value masked).")
+                logger.info(f"  Key '{key}' loaded from .env file (value masked).")
 
         if missing:
             raise EnvironmentError(
-                f"Missing required environment variable(s): {', '.join(missing)}"
+                f"Missing required environment variable(s): {', '.join(missing)}\n"
+                "  Ensure the key is set in your .env file or platform secrets."
             )
 
         return config
@@ -207,9 +246,7 @@ class LatestCSVReader:
                 f"No valid articles could be parsed from '{csv_path.name}'."
             )
 
-        logger.info(
-            f"Read {len(articles)} article(s) from '{csv_path.name}':"
-        )
+        logger.info(f"Read {len(articles)} article(s) from '{csv_path.name}':")
         for article in articles:
             logger.info(f"  {article}")
 
@@ -225,38 +262,39 @@ class NewsletterPromptBuilder:
     to produce a polished Markdown newsletter.
     """
 
-    _PERSONA: str = (
+    _SYSTEM_INSTRUCTION: str = (
         "You are a senior technology journalist with 15 years of experience "
         "writing for publications like MIT Technology Review and Wired. "
         "You specialise in writing sharp, insightful daily briefings that "
-        "respect your readers' time while delivering genuine analysis."
+        "respect your readers' time while delivering genuine analysis. "
+        "You respond with raw Markdown only — no code fences, no preamble, "
+        "no conversational openers like 'Sure!' or 'Here is your newsletter:'."
     )
 
     _FORMAT_RULES: str = "\n".join([
         "FORMAT RULES (follow precisely):",
-        "  1. Start with a bold Markdown title:  # 🗞️ Daily Tech Briefing — {date}",
+        "  1. Start with:  # 🗞️ Daily Tech Briefing — {date}",
         "  2. A 2–3 sentence editorial introduction that sets the day's narrative.",
         "  3. For EACH article:",
         "       ## [Article number]. [Compelling section title you write]",
         "       **Source:** [hyperlinked article title](link)",
-        "       A 3–4 sentence analysis covering: what it is, why it matters now,",
-        "       and one implication for developers, founders, or tech leaders.",
-        "  4. Close with a ## Editor's Note section: 3–4 sentences tying all",
-        "     stories into a single forward-looking insight or theme.",
-        "  5. End with a horizontal rule and a tagline:  *Briefing generated by",
-        "     Smart Data Extractor — AI Newsletter Engine*",
+        "       3–4 sentences of analysis: what it is, why it matters now,",
+        "       and one concrete implication for developers, founders, or tech leaders.",
+        "  4. Close with ## Editor's Note — 3–4 sentences tying all stories",
+        "     into a single forward-looking insight or theme.",
+        "  5. End with a horizontal rule and:",
+        "     *Briefing generated by Smart Data Extractor — AI Newsletter Engine*",
         "",
         "TONE: Professional but not stuffy. Analytical but not dry.",
         "      Think MIT Tech Review meets Morning Brew.",
-        "OUTPUT: Raw Markdown only. No code fences. No preamble. No 'Sure!' openers.",
     ])
 
     def build(self, articles: list[ArticleSummary]) -> str:
         """
-        Assembles the final prompt string from persona, format rules, and article data.
+        Assembles the final prompt string from format rules and article data.
 
         Args:
-            articles: List of ArticleSummary objects to include in the newsletter.
+            articles: List of ArticleSummary objects to include.
 
         Returns:
             The complete prompt string ready to send to the Gemini API.
@@ -267,14 +305,15 @@ class NewsletterPromptBuilder:
         if not articles:
             raise ValueError("Cannot build prompt: articles list is empty.")
 
-        today_str = datetime.now().strftime("%A, %B %d, %Y")  # e.g. Thursday, June 5, 2025
+        now = datetime.now()
+        today_str = now.strftime("%A, %B ") + str(now.day) + now.strftime(", %Y")
+
         article_block = "\n".join(
             f"  {a.rank}. TITLE: {a.title!r}\n     LINK:  {a.link}"
             for a in articles
         )
 
         prompt = (
-            f"{self._PERSONA}\n\n"
             f"{self._FORMAT_RULES}\n\n"
             f"Today's date: {today_str}\n\n"
             "TODAY'S ARTICLES TO COVER:\n"
@@ -284,58 +323,135 @@ class NewsletterPromptBuilder:
 
         logger.info(
             f"Prompt built: {len(prompt):,} chars | "
-            f"{len(articles)} articles | date: {today_str}"
+            f"{len(articles)} article(s) | date: {today_str}"
         )
         return prompt
 
+    @property
+    def system_instruction(self) -> str:
+        """Returns the system instruction string for the Gemini model config."""
+        return self._SYSTEM_INSTRUCTION
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini Client (Modern V2.0)
+# Gemini Client
 # ─────────────────────────────────────────────────────────────────────────────
 class GeminiClient:
     """
-    Wrapper around the modern google-genai SDK.
-    Handles model initialisation, generation, and response validation.
-    """
-    _MODEL_ID: str = "gemini-2.5-flash" 
+    Thin, focused wrapper around the google-genai SDK (v2+).
 
-    def __init__(self, api_key: str) -> None:
+    Migration note: replaces the deprecated google-generativeai package.
+    Uses genai.Client for explicit API-key binding and the
+    client.models.generate_content() call pattern for full type safety.
+    """
+
+    _MODEL_ID: str = "gemini-2.5-flash"
+
+    _GENERATION_CONFIG = genai_types.GenerateContentConfig(
+        temperature=0.75,       # Balanced: creative but grounded
+        top_p=0.95,
+        max_output_tokens=2048,
+    )
+
+    def __init__(self, api_key: str, system_instruction: str = "") -> None:
         if not api_key or not api_key.strip():
             raise ValueError("Gemini API key must not be empty.")
-        
-        # Initialize the new modern client
-        self._client = genai.Client(api_key=api_key)
-        logger.info(f"Modern Gemini client ready | model: {self._MODEL_ID}")
+
+        self._client = genai.Client(api_key=api_key.strip())
+
+        # Merge system instruction into the generation config if provided.
+        if system_instruction.strip():
+            self._generation_config = genai_types.GenerateContentConfig(
+                system_instruction=system_instruction.strip(),
+                temperature=self._GENERATION_CONFIG.temperature,
+                top_p=self._GENERATION_CONFIG.top_p,
+                max_output_tokens=self._GENERATION_CONFIG.max_output_tokens,
+            )
+        else:
+            self._generation_config = self._GENERATION_CONFIG
+
+        logger.info(f"Gemini client ready | model: {self._MODEL_ID}")
 
     def generate(self, prompt: str) -> str:
+        """
+        Sends the prompt to the Gemini API and returns the generated text.
+
+        Args:
+            prompt: The fully-constructed prompt string.
+
+        Returns:
+            The model's text response as a non-empty string.
+
+        Raises:
+            ValueError:   If the prompt is empty.
+            RuntimeError: If the API returns an error, blocks content,
+                          or produces an empty response.
+        """
         if not prompt.strip():
             raise ValueError("Prompt must not be empty.")
 
-        logger.info("Sending request to modern Gemini API — please wait...")
+        logger.info(
+            f"Sending request to Gemini API "
+            f"({len(prompt):,} chars) — please wait..."
+        )
 
         try:
-            # Modern generation call using types.GenerateContentConfig
             response = self._client.models.generate_content(
                 model=self._MODEL_ID,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.75,
-                    top_p=0.95,
-                    max_output_tokens=2048,
-                ) 
+                config=self._generation_config,
             )
-        except errors.APIError as exc:
-            raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+
+        except genai_errors.ClientError as exc:
+            # 4xx errors — invalid key, quota exceeded, malformed request
+            raise RuntimeError(
+                f"Gemini API client error ({getattr(exc, 'code', '4xx')}): {exc}\n"
+                "  ➜  Verify your API key and quota at https://aistudio.google.com"
+            ) from exc
+
+        except genai_errors.ServerError as exc:
+            # 5xx errors — service overloaded, temporary outage
+            raise RuntimeError(
+                f"Gemini API server error ({getattr(exc, 'code', '5xx')}): {exc}\n"
+                "  ➜  Google's servers may be under heavy load. Retry in a few minutes."
+            ) from exc
+
         except Exception as exc:
-            raise RuntimeError(f"Unexpected error: {exc}") from exc
+            raise RuntimeError(
+                f"Unexpected error communicating with Gemini API: {exc}"
+            ) from exc
 
-        # In the new SDK, .text returns None if blocked/empty, it doesn't raise ValueError
-        text = response.text
+        # ── Validate response ──────────────────────────────────────────────────
+        if not response.candidates:
+            feedback = getattr(response, "prompt_feedback", "No feedback available.")
+            raise RuntimeError(
+                f"Gemini returned no candidates. "
+                f"Prompt feedback: {feedback}"
+            )
+
+        candidate = response.candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+
+        if finish_reason and finish_reason != genai_types.FinishReason.STOP:
+            logger.warning(
+                f"Generation ended with non-STOP finish reason: {finish_reason}. "
+                f"Safety ratings: {getattr(candidate, 'safety_ratings', 'N/A')}"
+            )
+
+        text: str | None = response.text
         if not text or not text.strip():
-            raise RuntimeError("Gemini returned an empty text body. Content may have been blocked.")
+            raise RuntimeError(
+                f"Gemini returned an empty text body. "
+                f"Finish reason: {finish_reason} | "
+                f"Safety: {getattr(candidate, 'safety_ratings', 'N/A')}"
+            )
 
-        logger.info(f"Response received: {len(text):,} chars")
+        logger.info(
+            f"Response received: {len(text):,} chars | "
+            f"~{len(text.split()):,} words"
+        )
         return text
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Newsletter Exporter
@@ -387,10 +503,10 @@ class AINewsletterGenerator:
     """
     Facade that coordinates all five pipeline stages in sequence:
 
-        Stage 1 │ EnvironmentConfig       — Load .env, validate API key
-        Stage 2 │ LatestCSVReader         — Discover CSV → parse top 5 articles
+        Stage 1 │ EnvironmentConfig       — Resolve API key (cloud-first)
+        Stage 2 │ LatestCSVReader         — Discover CSV → parse top articles
         Stage 3 │ NewsletterPromptBuilder — Assemble structured Gemini prompt
-        Stage 4 │ GeminiClient           — Call Gemini API → receive newsletter
+        Stage 4 │ GeminiClient           — Call Gemini 2.5 Flash → newsletter
         Stage 5 │ NewsletterExporter     — Persist .md file to disk
     """
 
@@ -422,11 +538,13 @@ class AINewsletterGenerator:
             articles = reader.read_top(csv_path, top_n=self._TOP_N)
 
             # ── Stage 3: Prompt Assembly ──────────────────────────────────────
-            prompt = NewsletterPromptBuilder().build(articles)
+            builder = NewsletterPromptBuilder()
+            prompt = builder.build(articles)
 
             # ── Stage 4: AI Generation ────────────────────────────────────────
             newsletter_md = GeminiClient(
-                api_key=config["GEMINI_API_KEY"]
+                api_key=config["GEMINI_API_KEY"],
+                system_instruction=builder.system_instruction,
             ).generate(prompt)
 
             # ── Stage 5: Persistence ──────────────────────────────────────────
@@ -458,7 +576,7 @@ class AINewsletterGenerator:
     def _print_banner() -> None:
         logger.info("═" * 66)
         logger.info("  Smart Data Extractor · Phase 2 │ AI Newsletter Generator")
-        logger.info("  Engine  : Google Gemini 1.5 Flash")
+        logger.info("  Engine  : Google Gemini 2.5 Flash  (google-genai SDK v2+)")
         logger.info("  Input   : output/*.csv    Output: newsletters/*.md")
         logger.info("═" * 66)
 
