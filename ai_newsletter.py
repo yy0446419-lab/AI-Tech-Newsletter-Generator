@@ -3,8 +3,13 @@
 ║           Smart Data Extractor — Phase 2                        ║
 ║           AI-Powered Newsletter Generator                       ║
 ║           Model  : gemini-2.5-flash  (google-genai SDK)        ║
-║           Input  : output/*.csv  (Phase 1 artifact)            ║
+║           Input  : output/*.csv  (Phase 1 artifact)             ║
 ║           Output : newsletters/newsletter_<timestamp>.md        ║
+║                                                                    ║
+║           Architecture Roadmap · Phase 1 — Stabilize:           ║
+║             • No sys.exit() outside the CLI entry point below.  ║
+║             • All failures raise typed exceptions from           ║
+║               core.exceptions — callers decide how to react.    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -20,6 +25,15 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from dotenv import load_dotenv
+
+from core.exceptions import (
+    BriefingEngineError,
+    ConfigurationError,
+    LLMError,
+    LLMQuotaExceededError,
+    LLMServiceUnavailableError,
+    RepositoryError,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging Configuration
@@ -82,17 +96,15 @@ class EnvironmentConfig:
           - If ALL required keys are already present in os.environ, the .env
             file is bypassed entirely (cloud-compatible path).
           - If any key is missing from os.environ, the .env file is loaded.
-            FileNotFoundError is raised only when the file is genuinely absent
-            AND the key was not found in the environment.
+            ConfigurationError is raised only when the file is genuinely
+            absent AND the key was not found in the environment.
 
         Returns:
             A dict mapping each required key to its validated string value.
 
         Raises:
-            FileNotFoundError: If keys are missing from os.environ AND the
-                               .env file does not exist at the expected path.
-            EnvironmentError:  If any required key remains empty after all
-                               resolution attempts.
+            ConfigurationError: If a required key cannot be resolved from
+                                either os.environ or a local .env file.
         """
         # ── Step 1: Cloud-first check — inspect os.environ before touching disk ──
         prefilled = {k: os.environ.get(k, "").strip() for k in self._REQUIRED_KEYS}
@@ -109,7 +121,7 @@ class EnvironmentConfig:
 
         # ── Step 2: Local fallback — load .env file ───────────────────────────
         if not self._env_path.exists():
-            raise FileNotFoundError(
+            raise ConfigurationError(
                 f"GEMINI_API_KEY not found in os.environ, and no .env file exists at:\n"
                 f"  {self._env_path.resolve()}\n\n"
                 "  LOCAL  →  Create a .env file:     echo 'GEMINI_API_KEY=your_key' > .env\n"
@@ -135,7 +147,7 @@ class EnvironmentConfig:
                 logger.info(f"  Key '{key}' loaded from .env file (value masked).")
 
         if missing:
-            raise EnvironmentError(
+            raise ConfigurationError(
                 f"Missing required environment variable(s): {', '.join(missing)}\n"
                 "  Ensure the key is set in your .env file or platform secrets."
             )
@@ -163,10 +175,10 @@ class LatestCSVReader:
             Path to the most recently modified .csv file.
 
         Raises:
-            FileNotFoundError: If the directory or any CSV files are missing.
+            RepositoryError: If the directory or any CSV files are missing.
         """
         if not self._source_dir.exists():
-            raise FileNotFoundError(
+            raise RepositoryError(
                 f"Source directory not found: {self._source_dir.resolve()}\n"
                 "  ➜  Run Phase 1 (smart_data_extractor.py) first."
             )
@@ -178,7 +190,7 @@ class LatestCSVReader:
         )
 
         if not csv_files:
-            raise FileNotFoundError(
+            raise RepositoryError(
                 f"No .csv files found in: {self._source_dir.resolve()}\n"
                 "  ➜  Run Phase 1 (smart_data_extractor.py) to generate one."
             )
@@ -202,8 +214,9 @@ class LatestCSVReader:
             A list of ArticleSummary dataclasses.
 
         Raises:
-            IOError:    If the file cannot be opened or read.
-            ValueError: If no valid rows are found.
+            RepositoryError: If the file cannot be opened, is empty, is
+                             missing required columns, or contains no
+                             parseable rows.
         """
         articles: list[ArticleSummary] = []
 
@@ -212,12 +225,12 @@ class LatestCSVReader:
                 reader = csv.DictReader(fh)
 
                 if reader.fieldnames is None:
-                    raise ValueError(f"CSV appears to be empty: {csv_path.name}")
+                    raise RepositoryError(f"CSV appears to be empty: {csv_path.name}")
 
                 required_cols = {"rank", "title", "link"}
                 missing_cols = required_cols - {c.lower() for c in reader.fieldnames}
                 if missing_cols:
-                    raise ValueError(
+                    raise RepositoryError(
                         f"CSV is missing required columns: {missing_cols}. "
                         f"Found: {list(reader.fieldnames)}"
                     )
@@ -239,10 +252,10 @@ class LatestCSVReader:
                         )
 
         except IOError as exc:
-            raise IOError(f"Cannot read CSV file '{csv_path.name}': {exc}") from exc
+            raise RepositoryError(f"Cannot read CSV file '{csv_path.name}': {exc}") from exc
 
         if not articles:
-            raise ValueError(
+            raise RepositoryError(
                 f"No valid articles could be parsed from '{csv_path.name}'."
             )
 
@@ -300,7 +313,15 @@ class NewsletterPromptBuilder:
             The complete prompt string ready to send to the Gemini API.
 
         Raises:
-            ValueError: If the articles list is empty.
+            ValueError: If the articles list is empty. This is a caller
+                       contract violation (invalid input), not an
+                       operational/domain failure, so it deliberately
+                       remains a plain ValueError rather than a
+                       BriefingEngineError subclass. In the current
+                       pipeline this is unreachable — LatestCSVReader
+                       already raises RepositoryError before an empty
+                       list could ever reach this method — but the guard
+                       stays in place for any future caller of this class.
         """
         if not articles:
             raise ValueError("Cannot build prompt: articles list is empty.")
@@ -354,8 +375,15 @@ class GeminiClient:
     )
 
     def __init__(self, api_key: str, system_instruction: str = "") -> None:
+        """
+        Raises:
+            ConfigurationError: If api_key is empty or whitespace-only —
+                               an invalid/missing credential is a
+                               configuration problem, not a generic
+                               input-validation error.
+        """
         if not api_key or not api_key.strip():
-            raise ValueError("Gemini API key must not be empty.")
+            raise ConfigurationError("Gemini API key must not be empty.")
 
         self._client = genai.Client(api_key=api_key.strip())
 
@@ -383,9 +411,12 @@ class GeminiClient:
             The model's text response as a non-empty string.
 
         Raises:
-            ValueError:   If the prompt is empty.
-            RuntimeError: If the API returns an error, blocks content,
-                          or produces an empty response.
+            ValueError:                 If the prompt is empty (caller
+                                        contract violation).
+            LLMQuotaExceededError:      HTTP 429 — quota or rate limit hit.
+            LLMServiceUnavailableError: HTTP 503 — provider overloaded.
+            LLMError:                   Any other API failure, blocked
+                                        content, or empty response.
         """
         if not prompt.strip():
             raise ValueError("Prompt must not be empty.")
@@ -403,28 +434,37 @@ class GeminiClient:
             )
 
         except genai_errors.ClientError as exc:
-            # 4xx errors — invalid key, quota exceeded, malformed request
-            raise RuntimeError(
-                f"Gemini API client error ({getattr(exc, 'code', '4xx')}): {exc}\n"
-                "  ➜  Verify your API key and quota at https://aistudio.google.com"
+            code = getattr(exc, "code", None)
+            if code == 429:
+                raise LLMQuotaExceededError(
+                    f"Gemini API quota exceeded (HTTP 429): {exc}\n"
+                    "  ➜  Check your usage limits at https://aistudio.google.com"
+                ) from exc
+            raise LLMError(
+                f"Gemini API client error ({code or '4xx'}): {exc}\n"
+                "  ➜  Verify your API key and request format."
             ) from exc
 
         except genai_errors.ServerError as exc:
-            # 5xx errors — service overloaded, temporary outage
-            raise RuntimeError(
-                f"Gemini API server error ({getattr(exc, 'code', '5xx')}): {exc}\n"
-                "  ➜  Google's servers may be under heavy load. Retry in a few minutes."
+            code = getattr(exc, "code", None)
+            if code == 503:
+                raise LLMServiceUnavailableError(
+                    f"Gemini API temporarily overloaded (HTTP 503): {exc}\n"
+                    "  ➜  Google's servers may be under heavy load. Retry in a few minutes."
+                ) from exc
+            raise LLMError(
+                f"Gemini API server error ({code or '5xx'}): {exc}"
             ) from exc
 
         except Exception as exc:
-            raise RuntimeError(
+            raise LLMError(
                 f"Unexpected error communicating with Gemini API: {exc}"
             ) from exc
 
         # ── Validate response ──────────────────────────────────────────────────
         if not response.candidates:
             feedback = getattr(response, "prompt_feedback", "No feedback available.")
-            raise RuntimeError(
+            raise LLMError(
                 f"Gemini returned no candidates. "
                 f"Prompt feedback: {feedback}"
             )
@@ -440,7 +480,7 @@ class GeminiClient:
 
         text: str | None = response.text
         if not text or not text.strip():
-            raise RuntimeError(
+            raise LLMError(
                 f"Gemini returned an empty text body. "
                 f"Finish reason: {finish_reason} | "
                 f"Safety: {getattr(candidate, 'safety_ratings', 'N/A')}"
@@ -476,8 +516,10 @@ class NewsletterExporter:
             The resolved Path of the saved file.
 
         Raises:
-            ValueError: If content is empty.
-            IOError:    If the file cannot be written.
+            ValueError:      If content is empty (caller contract violation
+                             — unreachable in the current pipeline since
+                             GeminiClient.generate() never returns empty text).
+            RepositoryError: If the file cannot be written to disk.
         """
         if not content.strip():
             raise ValueError("Newsletter content must not be empty.")
@@ -493,7 +535,51 @@ class NewsletterExporter:
             return filepath
         except IOError as exc:
             logger.error(f"Failed to save newsletter: {exc}")
-            raise
+            raise RepositoryError(
+                f"Failed to save newsletter to '{filepath}': {exc}"
+            ) from exc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline Printer  (extracted utility — Architecture Roadmap Phase 1, Task 4)
+# ─────────────────────────────────────────────────────────────────────────────
+class PipelinePrinter:
+    """
+    Stateless presentation utility for pipeline console output.
+
+    Extracted from AINewsletterGenerator so that class is left to do exactly
+    one thing — orchestrate the five pipeline stages (SRP) — while all
+    console/log formatting concerns live here instead. `print_banner` is
+    intentionally generic (title + arbitrary detail lines) so it can be
+    reused by other pipelines; `print_summary` is newsletter-specific, since
+    a scraping pipeline's result summary (an article table) has a
+    fundamentally different shape than a newsletter's (a content preview).
+    """
+
+    @staticmethod
+    def print_banner(title: str, lines: list[str]) -> None:
+        """Logs a boxed banner with a title and any number of detail lines."""
+        logger.info("═" * 66)
+        logger.info(f"  {title}")
+        for line in lines:
+            logger.info(f"  {line}")
+        logger.info("═" * 66)
+
+    @staticmethod
+    def print_summary(content: str, saved_path: Path) -> None:
+        """Prints a preview of the first lines of generated content plus the save location."""
+        separator = "─" * 66
+        preview = "\n".join(
+            f"  {line}" for line in content.splitlines()[:10] if line.strip()
+        )
+        print(f"\n{separator}")
+        print("  📰  NEWSLETTER PREVIEW (first 10 non-empty lines)")
+        print(separator)
+        print(preview)
+        print(f"\n  ... [{len(content):,} chars total]")
+        print(separator)
+        print(f"  ✔  Saved to: {saved_path.resolve()}")
+        print(f"{separator}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,6 +594,11 @@ class AINewsletterGenerator:
         Stage 3 │ NewsletterPromptBuilder — Assemble structured Gemini prompt
         Stage 4 │ GeminiClient           — Call Gemini 2.5 Flash → newsletter
         Stage 5 │ NewsletterExporter     — Persist .md file to disk
+
+    This class never calls sys.exit(). Every failure mode raises a typed
+    exception from core.exceptions; the caller (a CLI entry point, a
+    Streamlit callback, or a future FastAPI route handler) decides what to
+    do with it.
     """
 
     _TOP_N: int = 5
@@ -523,8 +614,28 @@ class AINewsletterGenerator:
         self._env_file = env_file
 
     def run(self) -> None:
-        """Executes the complete pipeline. Exits with code 1 on any failure."""
-        self._print_banner()
+        """
+        Executes the complete pipeline.
+
+        Raises:
+            ConfigurationError:  GEMINI_API_KEY is missing or invalid.
+            RepositoryError:     Source CSV cannot be located/read, or the
+                                 generated newsletter cannot be written.
+            LLMQuotaExceededError:      Gemini rejected the request (HTTP 429).
+            LLMServiceUnavailableError: Gemini is temporarily overloaded (HTTP 503).
+            LLMError:            Any other AI generation failure.
+            BriefingEngineError: Wraps any other unexpected failure, so
+                                 that no raw built-in exception or
+                                 KeyboardInterrupt-adjacent noise ever
+                                 escapes this method uncategorized.
+        """
+        PipelinePrinter.print_banner(
+            title="Smart Data Extractor · Phase 2 │ AI Newsletter Generator",
+            lines=[
+                "Engine  : Google Gemini 2.5 Flash  (google-genai SDK v2+)",
+                "Input   : output/*.csv    Output: newsletters/*.md",
+            ],
+        )
 
         try:
             # ── Stage 1: Environment ──────────────────────────────────────────
@@ -552,57 +663,40 @@ class AINewsletterGenerator:
                 output_dir=self._output_dir
             ).export(newsletter_md)
 
-            self._print_summary(newsletter_md, output_path)
+            PipelinePrinter.print_summary(newsletter_md, output_path)
 
-        except (FileNotFoundError, EnvironmentError) as exc:
+        except ConfigurationError as exc:
             logger.critical(f"[CONFIG ERROR] {exc}")
-            sys.exit(1)
-        except (IOError, ValueError) as exc:
+            raise
+        except RepositoryError as exc:
             logger.critical(f"[DATA ERROR] {exc}")
-            sys.exit(1)
-        except RuntimeError as exc:
+            raise
+        except LLMError as exc:
             logger.critical(f"[AI ERROR] {exc}")
-            sys.exit(1)
+            raise
         except KeyboardInterrupt:
             logger.warning("Pipeline interrupted by user.")
-            sys.exit(0)
+            raise
         except Exception as exc:
             logger.critical(f"[UNEXPECTED ERROR] {exc}", exc_info=True)
-            sys.exit(1)
-
-    # ── Private Helpers ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _print_banner() -> None:
-        logger.info("═" * 66)
-        logger.info("  Smart Data Extractor · Phase 2 │ AI Newsletter Generator")
-        logger.info("  Engine  : Google Gemini 2.5 Flash  (google-genai SDK v2+)")
-        logger.info("  Input   : output/*.csv    Output: newsletters/*.md")
-        logger.info("═" * 66)
-
-    @staticmethod
-    def _print_summary(content: str, saved_path: Path) -> None:
-        """Prints a preview of the first lines and the final save location."""
-        separator = "─" * 66
-        preview = "\n".join(
-            f"  {line}" for line in content.splitlines()[:10] if line.strip()
-        )
-        print(f"\n{separator}")
-        print("  📰  NEWSLETTER PREVIEW (first 10 non-empty lines)")
-        print(separator)
-        print(preview)
-        print(f"\n  ... [{len(content):,} chars total]")
-        print(separator)
-        print(f"  ✔  Saved to: {saved_path.resolve()}")
-        print(f"{separator}\n")
+            raise BriefingEngineError(f"Unexpected pipeline failure: {exc}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
+# This is now the ONLY place in the file that calls sys.exit(). Every class
+# above raises; only the CLI boundary decides that a raised exception means
+# "terminate the process with a non-zero status."
 if __name__ == "__main__":
-    AINewsletterGenerator(
-        source_dir="output",
-        output_dir="newsletters",
-        env_file=".env",
-    ).run()
+    try:
+        AINewsletterGenerator(
+            source_dir="output",
+            output_dir="newsletters",
+            env_file=".env",
+        ).run()
+    except BriefingEngineError as exc:
+        logger.critical(f"Pipeline terminated: {exc}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(0)

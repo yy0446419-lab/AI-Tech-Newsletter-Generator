@@ -3,6 +3,11 @@
 ║           Smart Data Extractor — Phase 3                        ║
 ║           AI Tech Briefing Engine — Streamlit Web GUI           ║
 ║           Features: Live Pipeline · Archive · Graceful Fallback ║
+║                                                                    ║
+║           Architecture Roadmap · Phase 1 — Stabilize:           ║
+║             run_newsletter_stage() now catches the typed         ║
+║             exceptions raised by ai_newsletter.py directly,      ║
+║             instead of the generic SystemExit / Exception.       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -17,6 +22,12 @@ from dotenv import load_dotenv
 
 from smart_data_extractor import SmartDataExtractor
 from ai_newsletter import AINewsletterGenerator
+from core.exceptions import (
+    BriefingEngineError,
+    ConfigurationError,
+    LLMError,
+    RepositoryError,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration — all paths anchored to this file so the app behaves
@@ -336,6 +347,10 @@ def _gemini_key_available(env_path: str = ENV_FILE) -> bool:
       2. .env file second  — covers local development.
 
     Never raises; returns False if the key cannot be found by either method.
+
+    Note: not currently called by run_newsletter_stage(), which now relies on
+    ai_newsletter.py raising ConfigurationError directly (see below). Kept
+    as a standalone utility, unchanged, per this phase's minimal-diff scope.
     """
     # Priority 1: already injected into the process environment
     if os.getenv("GEMINI_API_KEY", "").strip():
@@ -354,8 +369,18 @@ def _gemini_key_available(env_path: str = ENV_FILE) -> bool:
 def run_scraping_stage() -> StageResult:
     """
     Executes Phase 1 (SmartDataExtractor).
-    Scraping failures are hard failures — without source data, no newsletter
-    can be produced and no fallback is meaningful.
+
+    NOTE: smart_data_extractor.py is intentionally unmodified in this phase
+    (Architecture Roadmap Phase 1 — Stabilize is scoped to ai_newsletter.py
+    and app.py only), so SmartDataExtractor.run() still calls sys.exit()
+    internally rather than raising a typed exception. This is why SystemExit
+    is still caught here, unlike run_newsletter_stage() below — once
+    smart_data_extractor.py is refactored into HackerNewsSource (Architecture
+    Roadmap Phase 2 — Strategy Pattern), this will raise ScrapingError
+    instead and this function can be simplified to match.
+
+    Scraping failures are always hard failures: without source data, no
+    newsletter (live or fallback) is meaningful, so there is no fallback path.
     """
     try:
         SmartDataExtractor(output_dir=OUTPUT_DIR).run()
@@ -381,10 +406,33 @@ def run_newsletter_stage() -> StageResult:
     """
     Executes Phase 2 (AINewsletterGenerator).
 
-    Any failure — missing API key, quota exceeded (429), service unavailable
-    (503), or unexpected exception — is treated as a soft failure with
-    `triggers_fallback=True`. The pipeline execution block then activates the
-    FallbackNewsletterGenerator instead of showing a hard error to the user.
+    ai_newsletter.py now raises typed exceptions from core.exceptions instead
+    of calling sys.exit(), so this function catches those directly — no more
+    generic `except SystemExit` / `except Exception`.
+
+    Exception routing:
+      ConfigurationError → hard failure, triggers_fallback=False.
+          GEMINI_API_KEY is missing or invalid. This is a setup problem, not
+          a transient API outage — silently showing a simulated briefing
+          would hide the fact that the app isn't configured correctly, so a
+          clear st.error is shown instead.
+      RepositoryError    → hard failure, triggers_fallback=False.
+          The source CSV couldn't be located/read, or the newsletter file
+          couldn't be written. This points to a real data/storage problem
+          upstream, which a fallback briefing would misleadingly paper over.
+      LLMError           → soft failure, triggers_fallback=True.
+          Covers the Gemini API itself failing for any reason (including its
+          LLMQuotaExceededError / LLMServiceUnavailableError subclasses,
+          which are caught here too since they inherit from LLMError). This
+          is exactly the transient, demo-visible failure mode the fallback
+          engine exists for.
+      BriefingEngineError → soft failure, triggers_fallback=True.
+          The base class — catches anything unexpected that doesn't fall
+          into a more specific category above (AINewsletterGenerator.run()
+          wraps any truly unforeseen internal error into this type before
+          it propagates). Treated the same as an LLM error for demo
+          resilience: the live pipeline failed unexpectedly, so fall back
+          rather than crash the UI.
     """
     try:
         AINewsletterGenerator(
@@ -394,18 +442,38 @@ def run_newsletter_stage() -> StageResult:
         ).run()
         return StageResult(success=True)
 
-    except SystemExit:
-        # AINewsletterGenerator.run() calls sys.exit(1) on all internal errors.
-        # We surface a generic message; the exact cause is in the log tail.
+    except ConfigurationError as exc:
+        # Full detail is already in newsletter_generator.log — ai_newsletter.py's
+        # logger.critical() ran before re-raising. The expander below surfaces it.
         return StageResult(
             success=False,
-            error_message="Gemini API pipeline exited — switching to simulation mode.",
+            error_message=(
+                "**Configuration error — `GEMINI_API_KEY` is missing or invalid.** "
+                "Add it as a Streamlit Secret (cloud) or in a local `.env` file."
+            ),
+            show_log_tail=True,
+            triggers_fallback=False,
+        )
+
+    except RepositoryError as exc:
+        return StageResult(
+            success=False,
+            error_message=f"**Data error:** `{exc}`",
+            show_log_tail=True,
+            triggers_fallback=False,
+        )
+
+    except LLMError as exc:
+        return StageResult(
+            success=False,
+            error_message=f"Gemini API error: {exc}",
             triggers_fallback=True,
         )
-    except Exception as exc:
+
+    except BriefingEngineError as exc:
         return StageResult(
             success=False,
-            error_message=f"Unexpected AI generation error: {exc}",
+            error_message=f"Unexpected pipeline error: {exc}",
             triggers_fallback=True,
         )
 
@@ -533,8 +601,8 @@ if generate_clicked:
                     state="complete",
                     expanded=False,
                 )
-            else:
-                # Soft failure → graceful fallback (status stays "complete", not "error")
+            elif newsletter_result.triggers_fallback:
+                # Soft failure (LLMError / BriefingEngineError) — fallback is coming.
                 pipeline_status.write(
                     "⚡ Gemini API unavailable — activating simulation mode..."
                 )
@@ -542,6 +610,16 @@ if generate_clicked:
                     label="⚡ API busy — loading simulated briefing...",
                     state="complete",
                     expanded=False,
+                )
+            else:
+                # Hard failure (ConfigurationError / RepositoryError) — no fallback.
+                pipeline_status.write(
+                    "❌ Newsletter generation failed — see details below."
+                )
+                pipeline_status.update(
+                    label="❌ Newsletter generation failed.",
+                    state="error",
+                    expanded=True,
                 )
 
     # ── Post-status logic (must live OUTSIDE the `with st.status` block) ──────
@@ -556,8 +634,20 @@ if generate_clicked:
                 with st.expander("🔍 Show technical diagnostics"):
                     st.code(tail, language="text")
 
+    elif not newsletter_result.success and not newsletter_result.triggers_fallback:
+        # Hard failure: ConfigurationError or RepositoryError — show a clear
+        # error and stop. No fallback, no rerun: the person needs to fix the
+        # underlying setup/data issue before trying again.
+        st.error(newsletter_result.error_message or "Newsletter generation failed.", icon="🚫")
+        if newsletter_result.show_log_tail:
+            tail = _read_log_tail(LOG_CANDIDATES)
+            if tail:
+                with st.expander("🔍 Show technical diagnostics"):
+                    st.code(tail, language="text")
+
     elif not newsletter_result.success:
-        # Soft failure — activate the fallback engine silently.
+        # Soft failure (triggers_fallback is True here by elimination) —
+        # activate the fallback engine silently.
         fallback_saved = False
         try:
             FallbackNewsletterGenerator(output_dir=NEWSLETTER_DIR).generate_and_save()
