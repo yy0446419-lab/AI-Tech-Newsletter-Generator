@@ -20,7 +20,7 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
-from smart_data_extractor import SmartDataExtractor
+from smart_data_extractor import ExtractionPipeline
 from ai_newsletter import AINewsletterGenerator
 from core.exceptions import (
     BriefingEngineError,
@@ -383,7 +383,7 @@ def run_scraping_stage() -> StageResult:
     newsletter (live or fallback) is meaningful, so there is no fallback path.
     """
     try:
-        SmartDataExtractor(output_dir=OUTPUT_DIR).run()
+        ExtractionPipeline(source_id="hacker_news", output_dir=OUTPUT_DIR).run()
         return StageResult(success=True)
     except SystemExit:
         return StageResult(
