@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import os
-
+import asyncio
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -383,9 +383,9 @@ def run_scraping_stage() -> StageResult:
     newsletter (live or fallback) is meaningful, so there is no fallback path.
     """
     try:
-        ExtractionPipeline(source_id="hacker_news", output_dir=OUTPUT_DIR).run()
+        asyncio.run(ExtractionPipeline(output_dir=OUTPUT_DIR).run())
         return StageResult(success=True)
-    except SystemExit:
+    except SystemExit: 
         return StageResult(
             success=False,
             error_message=(

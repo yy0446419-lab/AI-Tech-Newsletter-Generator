@@ -1,17 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           HTTP Client — Shared Extraction Infrastructure         ║
-║           Architecture Roadmap · Phase 2 — Strategy Pattern      ║
+║           Async HTTP Client — Shared Extraction Infrastructure   ║
+║           Architecture Roadmap · Phase 3 — Asynchronous          ║
+║           Processing                                              ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-Generic, source-agnostic HTTP client with retry logic. Every concrete
-IContentSource implementation can reuse this instead of hand-rolling
-its own requests.Session and retry loop.
+Generic, source-agnostic ASYNC HTTP client with retry logic, built on
+httpx.AsyncClient. Every concrete IContentSource implementation awaits
+this instead of hand-rolling its own async session and retry loop —
+this is what lets ExtractionPipeline fetch every registered source
+concurrently via asyncio.gather().
 """
 
 import logging
 
-import requests
+import httpx
 
 from core.exceptions import ScrapingError
 
@@ -20,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 class HTTPClient:
     """
-    Manages a persistent requests.Session with retry logic,
-    custom headers, and configurable timeouts.
+    Manages a persistent httpx.AsyncClient with retry logic, custom
+    headers, and configurable timeouts.
     """
 
     _DEFAULT_HEADERS: dict[str, str] = {
@@ -39,12 +42,18 @@ class HTTPClient:
     def __init__(self, timeout: int = 15, max_retries: int = 3) -> None:
         self._timeout = timeout
         self._max_retries = max_retries
-        self._session = requests.Session()
-        self._session.headers.update(self._DEFAULT_HEADERS)
+        # follow_redirects=True is explicit because httpx, unlike requests,
+        # defaults it to False — omitting this would silently change
+        # behavior on any source that redirects.
+        self._session = httpx.AsyncClient(
+            headers=self._DEFAULT_HEADERS,
+            timeout=timeout,
+            follow_redirects=True,
+        )
 
-    def get(self, url: str) -> str:
+    async def get(self, url: str) -> str:
         """
-        Performs a GET request with retry logic.
+        Performs an async GET request with retry logic.
 
         Args:
             url: The target URL to fetch.
@@ -59,7 +68,7 @@ class HTTPClient:
         for attempt in range(1, self._max_retries + 1):
             try:
                 logger.info(f"GET {url!r}  (attempt {attempt}/{self._max_retries})")
-                response = self._session.get(url, timeout=self._timeout)
+                response = await self._session.get(url)
                 response.raise_for_status()
                 logger.info(
                     f"Response: HTTP {response.status_code} | "
@@ -67,14 +76,16 @@ class HTTPClient:
                 )
                 return response.text
 
-            except requests.exceptions.Timeout:
+            except httpx.TimeoutException:
                 logger.warning(f"Attempt {attempt}: Request timed out after {self._timeout}s.")
-            except requests.exceptions.ConnectionError as exc:
-                logger.warning(f"Attempt {attempt}: Connection error — {exc}")
-            except requests.exceptions.HTTPError as exc:
+            except httpx.TransportError as exc:
+                # Covers ConnectError, ReadError, WriteError, ProtocolError,
+                # ProxyError, etc. — anything transient at the connection level.
+                logger.warning(f"Attempt {attempt}: Transport/connection error — {exc}")
+            except httpx.HTTPStatusError as exc:
                 logger.error(f"HTTP error (non-retryable): {exc}")
                 raise ScrapingError(f"HTTP error fetching {url!r}: {exc}") from exc
-            except requests.exceptions.RequestException as exc:
+            except httpx.RequestError as exc:
                 logger.error(f"Unexpected request exception: {exc}")
                 raise ScrapingError(f"Request failed for {url!r}: {exc}") from exc
 
@@ -82,13 +93,13 @@ class HTTPClient:
             f"All {self._max_retries} attempts failed for URL: {url!r}"
         )
 
-    def close(self) -> None:
-        """Closes the underlying HTTP session and releases resources."""
-        self._session.close()
+    async def close(self) -> None:
+        """Closes the underlying async HTTP session and releases resources."""
+        await self._session.aclose()
         logger.debug("HTTP session closed.")
 
-    def __enter__(self) -> "HTTPClient":
+    async def __aenter__(self) -> "HTTPClient":
         return self
 
-    def __exit__(self, *_) -> None:
-        self.close()
+    async def __aexit__(self, *_) -> None:
+        await self.close()

@@ -1,26 +1,30 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           Extraction Pipeline                                     ║
-║           Architecture Roadmap · Phase 2 — Strategy Pattern      ║
+║           Extraction Pipeline — Asynchronous, Multi-Source        ║
+║           Architecture Roadmap · Phase 3 — Asynchronous           ║
+║           Processing                                              ║
 ║                                                                    ║
-║           Generic orchestrator: resolves a content source by     ║
-║           source_id from SourceRegistry, extracts articles, and  ║
-║           exports them to CSV. Adding a new source never         ║
-║           requires modifying this file — see the registration    ║
-║           block below.                                           ║
+║           Concurrently fetches every registered IContentSource    ║
+║           via asyncio.gather(), merges the results (tagging each ║
+║           Article with its source_id for provenance), and        ║
+║           exports the combined set to a single CSV. A source     ║
+║           that fails does not take down the others — the         ║
+║           pipeline only fails if every source fails.             ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
+import asyncio
 import csv
+import dataclasses
 import logging
 import sys
-from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 
 from core.exceptions import BriefingEngineError, RepositoryError, ScrapingError
 from core.protocols import Article, IContentSource
 from infrastructure.sources.hacker_news import HackerNewsSource
+from infrastructure.sources.reddit import RedditSource
 from infrastructure.sources.registry import SourceRegistry
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,11 +45,11 @@ logger = logging.getLogger(__name__)
 # Source Registration
 # ─────────────────────────────────────────────────────────────────────────────
 # Every available IContentSource strategy is registered here, once, at
-# import time — both the CLI entry point below and any external caller
-# (e.g. app.py) that imports this module get a fully populated registry.
-# Adding Reddit or Bloomberg later means one new file in
-# infrastructure/sources/ and one new line here. Nothing else changes.
+# import time. Adding a third source means one new file in
+# infrastructure/sources/ and one new line here — ExtractionPipeline
+# below never changes.
 SourceRegistry.register(HackerNewsSource())
+SourceRegistry.register(RedditSource())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,26 +57,24 @@ SourceRegistry.register(HackerNewsSource())
 # ─────────────────────────────────────────────────────────────────────────────
 class CSVExporter:
     """
-    Serialises a list of Article objects into a UTF-8 CSV file, with a
-    filename tagged by source and timestamp, inside a configurable
-    output directory.
+    Serialises a merged, multi-source list of Article objects into a
+    single UTF-8 CSV file. Each row's `source_id` column preserves
+    which source it came from.
     """
 
-    _FILENAME_TEMPLATE: str = "{source_id}_{timestamp}.csv"
+    _FILENAME_TEMPLATE: str = "briefing_articles_{timestamp}.csv"
 
     def __init__(self, output_dir: str = "output") -> None:
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    def export(self, articles: list[Article], source_id: str) -> Path:
+    def export(self, articles: list[Article]) -> Path:
         """
         Writes articles to a CSV file.
 
         Args:
-            articles:  Non-empty list of Article objects to serialise.
-            source_id: The source_id these articles came from — embedded
-                      in the filename so multiple sources' exports never
-                      collide and stay identifiable at a glance.
+            articles: Non-empty list of Article objects, typically
+                     merged from multiple sources.
 
         Returns:
             The resolved Path of the created CSV file.
@@ -80,9 +82,7 @@ class CSVExporter:
         Raises:
             ValueError:      If the articles list is empty (caller
                              contract violation — unreachable in the
-                             current pipeline, since ExtractionPipeline
-                             raises ScrapingError before an empty list
-                             could reach this method).
+                             current pipeline).
             RepositoryError: If the file cannot be written.
         """
         if not articles:
@@ -90,9 +90,9 @@ class CSVExporter:
 
         timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath: Path = self._output_dir / self._FILENAME_TEMPLATE.format(
-            source_id=source_id, timestamp=timestamp
+            timestamp=timestamp
         )
-        column_names: list[str] = [f.name for f in fields(Article)]
+        column_names: list[str] = [f.name for f in dataclasses.fields(Article)]
 
         try:
             with filepath.open(mode="w", newline="", encoding="utf-8") as csv_file:
@@ -116,60 +116,87 @@ class CSVExporter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Extraction Pipeline  (Strategy Context)
+# Extraction Pipeline  (Strategy Context — concurrent, multi-source)
 # ─────────────────────────────────────────────────────────────────────────────
 class ExtractionPipeline:
     """
-    Generic orchestrator for any registered IContentSource strategy.
+    Concurrently fetches every registered IContentSource, merges the
+    results, and exports them to a single CSV.
 
-        Stage 1 │ SourceRegistry.get(source_id) — resolve the strategy
-        Stage 2 │ source.extract(limit)         — fetch + parse articles
-        Stage 3 │ CSVExporter.export(articles)   — persist to CSV
+        Stage 1 │ SourceRegistry.available_ids() — discover all sources
+        Stage 2 │ asyncio.gather(*extract calls)  — fetch concurrently
+        Stage 3 │ merge + tag with source_id       — preserve provenance
+        Stage 4 │ CSVExporter.export(merged)        — persist to CSV
 
-    This class has no knowledge of Hacker News, Reddit, or any other
-    specific source — that is the entire point of the Strategy pattern.
-    It depends only on the IContentSource abstraction and the registry
-    that resolves concrete implementations by string ID. Never calls
+    A single failing source does not fail the whole run — partial
+    results from the sources that succeeded are still exported. The
+    pipeline only raises if every registered source fails. Never calls
     sys.exit(); every failure raises a typed exception from
     core.exceptions and the caller decides what to do with it.
     """
 
     _ARTICLE_LIMIT: int = 20
 
-    def __init__(self, source_id: str, output_dir: str = "output") -> None:
-        self._source_id = source_id
+    def __init__(self, output_dir: str = "output") -> None:
         self._output_dir = output_dir
 
-    def run(self) -> None:
+    async def run(self) -> None:
         """
-        Executes the full pipeline: resolve source → extract → export.
+        Executes the full pipeline: fetch every source concurrently →
+        merge → export.
 
         Raises:
-            ScrapingError:        source_id is not registered, or the
-                                  source's extract() call fails.
+            ScrapingError:        No sources are registered, or every
+                                  registered source failed to extract.
             RepositoryError:      The CSV file cannot be written.
             BriefingEngineError:  Wraps any other unexpected failure.
         """
-        self._print_banner()
+        source_ids = SourceRegistry.available_ids()
+        self._print_banner(source_ids)
 
         try:
-            source: IContentSource = SourceRegistry.get(self._source_id)
-            articles = source.extract(limit=self._ARTICLE_LIMIT)
+            if not source_ids:
+                raise ScrapingError("No content sources are registered.")
 
-            if not articles:
+            sources = [SourceRegistry.get(sid) for sid in source_ids]
+
+            results = await asyncio.gather(
+                *(self._extract_from_source(s) for s in sources),
+                return_exceptions=True,
+            )
+
+            all_articles: list[Article] = []
+            failures: list[tuple[str, BaseException]] = []
+
+            for source, result in zip(sources, results):
+                if isinstance(result, BaseException):
+                    failures.append((source.source_id, result))
+                    logger.warning(f"Source '{source.source_id}' failed: {result}")
+                else:
+                    all_articles.extend(result)
+                    logger.info(f"Source '{source.source_id}': {len(result)} article(s).")
+
+            if not all_articles:
                 raise ScrapingError(
-                    f"Source '{self._source_id}' returned zero articles."
+                    f"All {len(sources)} registered source(s) failed. "
+                    f"Failures: {[(sid, str(exc)) for sid, exc in failures]}"
                 )
 
-            self._preview(articles)
-            output_path = CSVExporter(output_dir=self._output_dir).export(
-                articles, source_id=self._source_id
-            )
+            if failures:
+                logger.warning(
+                    f"{len(failures)}/{len(sources)} source(s) failed; "
+                    f"proceeding with {len(all_articles)} articles from the "
+                    f"{len(sources) - len(failures)} source(s) that succeeded."
+                )
+
+            self._preview(all_articles)
+            output_path = CSVExporter(output_dir=self._output_dir).export(all_articles)
 
             logger.info("─" * 66)
             logger.info(
-                f"  ✔  Pipeline complete — {len(articles)} articles "
-                f"from '{self._source_id}' saved to: {output_path.name}"
+                f"  ✔  Pipeline complete — {len(all_articles)} articles "
+                f"from {len(sources) - len(failures)}/{len(sources)} source(s) "
+                f"saved to: {output_path.name}"
             )
             logger.info("─" * 66)
 
@@ -189,10 +216,21 @@ class ExtractionPipeline:
             ) from exc
 
     # ── Private Helpers ───────────────────────────────────────────────────────
-    def _print_banner(self) -> None:
+    async def _extract_from_source(self, source: IContentSource) -> list[Article]:
+        """
+        Extracts from a single source and tags each returned Article with
+        that source's source_id, so the merged CSV preserves per-row
+        provenance without requiring every source implementation to set
+        this field itself.
+        """
+        articles = await source.extract(limit=self._ARTICLE_LIMIT)
+        return [dataclasses.replace(a, source_id=source.source_id) for a in articles]
+
+    @staticmethod
+    def _print_banner(source_ids: list[str]) -> None:
         logger.info("═" * 66)
-        logger.info(f"  Extraction Pipeline │ Source: {self._source_id!r}")
-        logger.info(f"  Registered sources: {', '.join(SourceRegistry.available_ids())}")
+        logger.info("  Extraction Pipeline │ Concurrent Multi-Source Fetch")
+        logger.info(f"  Sources: {', '.join(source_ids) or '(none registered)'}")
         logger.info("═" * 66)
 
     @staticmethod
@@ -200,14 +238,13 @@ class ExtractionPipeline:
         """Prints a formatted table of extracted articles to stdout."""
         separator = "─" * 66
         print(f"\n{separator}")
-        print(f"  {'RK':>2}  {'TITLE':<45}  {'PTS':>6}  {'CMT':>5}")
+        print(f"  {'RK':>2}  {'SOURCE':<12}  {'TITLE':<38}  {'PTS':>6}")
         print(separator)
         for article in articles:
             pts = str(article.points) if article.points is not None else "N/A"
-            cmt = str(article.comments) if article.comments is not None else "N/A"
+            src = (article.source_id or "?")[:12]
             print(
-                f"  {article.rank:>2}  {article.title[:45]:<45}  "
-                f"{pts:>6}  {cmt:>5}"
+                f"  {article.rank:>2}  {src:<12}  {article.title[:38]:<38}  {pts:>6}"
             )
         print(f"{separator}\n")
 
@@ -217,7 +254,7 @@ class ExtractionPipeline:
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
-        ExtractionPipeline(source_id="hacker_news", output_dir="output").run()
+        asyncio.run(ExtractionPipeline(output_dir="output").run())
     except BriefingEngineError as exc:
         logger.critical(f"Pipeline terminated: {exc}")
         sys.exit(1)

@@ -1,20 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║           AI Tech Briefing Engine — Core Protocols                ║
-║           Architecture Roadmap · Phase 2 — Strategy Pattern      ║
+║           Architecture Roadmap · Phase 3 — Asynchronous           ║
+║           Processing                                              ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-Defines the Article data contract and the IContentSource protocol that
-every extraction strategy (Hacker News, Reddit, Bloomberg, ...) must
-implement.
-
-This module belongs to core/: it defines *what* an extraction strategy
-looks like, never *how* any specific one works. Concrete implementations
-live in infrastructure/sources/ and import from here — never the other
-way around. That is the Dependency Inversion this roadmap phase
-introduces: application code (ExtractionPipeline) and infrastructure
-code (HackerNewsSource) both depend on this abstraction; neither
-depends on the other directly.
+Defines the Article data contract and the IContentSource protocol.
+extract() is now a coroutine so ExtractionPipeline can fetch every
+registered source concurrently via asyncio.gather() instead of
+sequentially, one at a time.
 """
 
 from dataclasses import dataclass
@@ -27,12 +21,13 @@ class Article:
     Immutable value object representing a single extracted article,
     independent of which source produced it.
 
-    `points`, `comments`, and `posted_by` default to None because not
-    every source exposes all three (a Bloomberg RSS item has no upvote
-    count; a Hacker News job posting has no comment count). None means
-    "not applicable to this source"; 0 means "applicable, and the value
-    is zero" — sources should preserve that distinction rather than
-    collapsing "not applicable" down to a numeric zero.
+    `source_id` is set by ExtractionPipeline after extraction (not by
+    the source itself) — see smart_data_extractor.py — so that once
+    multiple sources' results are merged into one list, each row still
+    records which source it came from. `points`, `comments`, and
+    `posted_by` default to None because not every source exposes all
+    three; None means "not applicable to this source," 0 means
+    "applicable, and the value is zero."
     """
 
     rank: int
@@ -41,6 +36,7 @@ class Article:
     points: Optional[int] = None
     comments: Optional[int] = None
     posted_by: Optional[str] = None
+    source_id: Optional[str] = None
 
     def __str__(self) -> str:
         return (
@@ -55,15 +51,13 @@ class IContentSource(Protocol):
     """
     Contract for any content extraction strategy.
 
-    Every concrete source (HackerNewsSource, and future strategies such
-    as a RedditSource or BloombergRSSSource) implements this protocol.
-    ExtractionPipeline depends on this abstraction only — it never
-    imports a concrete source class — so adding a new source never
-    requires modifying the pipeline itself.
-
-    `@runtime_checkable` enables isinstance() checks, which
-    SourceRegistry.register() uses to reject any object that does not
-    actually satisfy this contract before it ever reaches the pipeline.
+    extract() is a coroutine: ExtractionPipeline awaits every registered
+    source concurrently via asyncio.gather(), so a slow or high-latency
+    source never adds to the others' wait time. @runtime_checkable still
+    works correctly here — Protocol's isinstance() check is a structural
+    "does this attribute/method exist by name" check, not a signature or
+    sync/async inspection, so SourceRegistry.register()'s isinstance()
+    guard needs no changes for this to keep working.
     """
 
     @property
@@ -71,15 +65,14 @@ class IContentSource(Protocol):
         """
         Stable, machine-readable identifier for this source.
 
-        Used as the SourceRegistry lookup key, in log messages, and to
-        tag exported CSV filenames. Examples: "hacker_news",
-        "reddit_programming", "bloomberg_rss". Should be lowercase,
-        snake_case, and never change once a source ships, since it may
-        end up embedded in saved filenames.
+        Used as the SourceRegistry lookup key, in log messages, and
+        stamped onto every Article this source produces once merged by
+        the pipeline. Should be lowercase, snake_case, and never change
+        once a source ships.
         """
         ...
 
-    def extract(self, limit: int = 20) -> list[Article]:
+    async def extract(self, limit: int = 20) -> list[Article]:
         """
         Fetches and parses articles from this source.
 

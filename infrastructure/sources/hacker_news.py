@@ -1,14 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║           Hacker News Source — Strategy Implementation           ║
-║           Architecture Roadmap · Phase 2 — Strategy Pattern      ║
+║           Architecture Roadmap · Phase 3 — Asynchronous          ║
+║           Processing                                              ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Concrete IContentSource implementation for news.ycombinator.com.
-Fetching and Hacker-News-specific HTML parsing both live here, fully
-encapsulated behind the single extract() method the protocol requires.
-No other file in the codebase needs to know how Hacker News's DOM is
-structured.
+extract() is now async, awaiting the network fetch — but HTML parsing
+stays fully synchronous, since it's CPU-bound work with no I/O and
+gains nothing from being async.
 """
 
 import logging
@@ -51,12 +51,10 @@ class HackerNewsSource(IContentSource):
         """
         Args:
             http_client: Optional pre-configured HTTPClient. Defaults to
-                        a new instance with standard timeout/retry
-                        settings. Accepting one as a parameter — rather
-                        than always constructing it internally — makes
-                        this class easy to unit test with a fake client,
-                        and lets a caller share one client across
-                        multiple sources if desired.
+                        a new instance. Accepting one as a parameter
+                        makes this class easy to unit test with a fake
+                        client, and lets a caller share one client
+                        across multiple sources if desired.
         """
         self._client = http_client or HTTPClient(timeout=15, max_retries=3)
         self._owns_client = http_client is None
@@ -65,7 +63,7 @@ class HackerNewsSource(IContentSource):
     def source_id(self) -> str:
         return self._SOURCE_ID
 
-    def extract(self, limit: int = 20) -> list[Article]:
+    async def extract(self, limit: int = 20) -> list[Article]:
         """
         Fetches the Hacker News front page and parses it into articles.
 
@@ -80,16 +78,16 @@ class HackerNewsSource(IContentSource):
                           parsed into at least one article.
         """
         try:
-            html = self._client.get(self._TARGET_URL)
+            html = await self._client.get(self._TARGET_URL)
         finally:
             # Only close a client this instance created itself — an
             # injected client may be shared/reused by its owner.
             if self._owns_client:
-                self._client.close()
+                await self._client.close()
 
         return self._parse(html, limit=limit)
 
-    # ── Private parsing helpers ──────────────────────────────────────────────
+    # ── Private parsing helpers (synchronous — pure CPU-bound work) ──────────
 
     def _parse(self, html: str, limit: int) -> list[Article]:
         try:
