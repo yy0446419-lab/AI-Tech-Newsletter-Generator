@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment / secrets — never bake credentials into an image layer
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Runtime data — generated at container runtime and mounted as volumes
+# in docker-compose.yml, so any stale local copies should never be
+# baked into the image itself
+output/
+newsletters/
+*.csv
+*.log
+
+# Tests (none yet, but excluded pre-emptively — standard practice so a
+# future test suite never bloats the runtime image)
+tests/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker files themselves — editing these shouldn't invalidate app layers
+Dockerfile
+docker-compose.yml
+.dockerignore

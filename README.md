@@ -15,3 +15,14 @@ An automated pipeline that scrapes technical articles from public sources and le
 4. **Delivery:** Persists the final output as a professionally formatted Markdown (`.md`) briefing.
 
 *Designed for high reliability, modularity, and rapid adaptation to business automation needs.*
+## Running with Docker
+
+The entire AI Tech Briefing Engine runs in a single container — no local Python environment needed.
+
+### Prerequisites
+- Docker and Docker Compose installed
+- A Gemini API key ([get one free](https://aistudio.google.com/app/apikey))
+
+### Setup
+
+1. Create a `.env` file in the project root:

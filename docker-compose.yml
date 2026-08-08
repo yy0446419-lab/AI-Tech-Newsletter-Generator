@@ -1,0 +1,25 @@
+services:
+  briefing-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-tech-briefing-engine:latest
+    container_name: ai-tech-briefing-engine
+    ports:
+      - "8501:8501"
+    env_file:
+      # GEMINI_API_KEY read from here and injected into the container's
+      # os.environ — this is exactly the "cloud-first" path
+      # EnvironmentConfig.load() checks first (see ai_newsletter.py),
+      # so no in-container .env file handling is needed at all.
+      - .env
+    volumes:
+      # Scraped CSVs and generated briefings persist on the host across
+      # container restarts/rebuilds — without these, every restart wipes
+      # the sidebar's Briefing Archive.
+      - ./output:/app/output
+      - ./newsletters:/app/newsletters
+    restart: unless-stopped
+    # Health check behavior is inherited from the image's Dockerfile
+    # HEALTHCHECK instruction — not redefined here to avoid the two
+    # definitions drifting out of sync.
