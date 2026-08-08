@@ -3,8 +3,8 @@
 An automated pipeline that scrapes technical articles from public sources and leverages **Google Gemini AI** to generate professional, engaging daily newsletters. Built with pure OOP principles in Python.
 
 ## 🛠️ Tech Stack & Features
-* **Python 3.14** (Strict typing & Modular OOP architecture)
-* **Web Scraping:** `requests`, `BeautifulSoup4` (with robust error handling)
+* **Python 3.12** (Strict typing & Modular OOP architecture)
+* **Web Scraping:** httpx, asyncio, BeautifulSoup4 (Asynchronous, concurrent fetching)
 * **AI Integration:** `google-genai` (Gemini 2.5 Flash for advanced content synthesis)
 * **Security:** `python-dotenv` for API key management
 
@@ -26,3 +26,18 @@ The entire AI Tech Briefing Engine runs in a single container — no local Pytho
 ### Setup
 
 1. Create a `.env` file in the project root:
+GEMINI_API_KEY=your_key_here
+
+
+2. Build and start the container:
+```bash
+   docker-compose up --build
+```
+
+3. Open the app at [http://localhost:8501](http://localhost:8501)
+
+### Notes
+- `output/` and `newsletters/` are mounted as volumes, so scraped data and generated briefings persist across restarts and rebuilds.
+- If you hit a permission error writing to `output/` or `newsletters/` on a Linux host, run `chmod -R 777 output newsletters` locally — the container runs as a non-root user (UID 1000), and host-mounted volume ownership can occasionally mismatch it.
+- Stop the container: `docker-compose down`
+- Rebuild after a dependency change: `docker-compose up --build`
