@@ -4,10 +4,11 @@
 ║           AI Tech Briefing Engine — Streamlit Web GUI           ║
 ║           Features: Live Pipeline · Archive · Graceful Fallback ║
 ║                                                                    ║
-║           Architecture Roadmap · Phase 1 — Stabilize:           ║
-║             run_newsletter_stage() now catches the typed         ║
-║             exceptions raised by ai_newsletter.py directly,      ║
-║             instead of the generic SystemExit / Exception.       ║
+║           Architecture Roadmap · Phase 1–3 complete:            ║
+║             run_scraping_stage() and run_newsletter_stage()      ║
+║             both catch the typed exceptions their respective     ║
+║             pipelines raise — no more SystemExit / generic       ║
+║             Exception catches on either path.                    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -27,6 +28,7 @@ from core.exceptions import (
     ConfigurationError,
     LLMError,
     RepositoryError,
+    ScrapingError,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,9 +350,9 @@ def _gemini_key_available(env_path: str = ENV_FILE) -> bool:
 
     Never raises; returns False if the key cannot be found by either method.
 
-    Note: not currently called by run_newsletter_stage(), which now relies on
-    ai_newsletter.py raising ConfigurationError directly (see below). Kept
-    as a standalone utility, unchanged, per this phase's minimal-diff scope.
+    Note: not currently called by run_newsletter_stage(), which relies on
+    ai_newsletter.py raising ConfigurationError directly. Kept as a
+    standalone utility, unused but harmless.
     """
     # Priority 1: already injected into the process environment
     if os.getenv("GEMINI_API_KEY", "").strip():
@@ -368,16 +370,19 @@ def _gemini_key_available(env_path: str = ENV_FILE) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 def run_scraping_stage() -> StageResult:
     """
-    Executes Phase 1 (SmartDataExtractor).
+    Executes the extraction pipeline (Architecture Roadmap Phase 2 — Strategy
+    Pattern, Phase 3 — Asynchronous Processing).
 
-    NOTE: smart_data_extractor.py is intentionally unmodified in this phase
-    (Architecture Roadmap Phase 1 — Stabilize is scoped to ai_newsletter.py
-    and app.py only), so SmartDataExtractor.run() still calls sys.exit()
-    internally rather than raising a typed exception. This is why SystemExit
-    is still caught here, unlike run_newsletter_stage() below — once
-    smart_data_extractor.py is refactored into HackerNewsSource (Architecture
-    Roadmap Phase 2 — Strategy Pattern), this will raise ScrapingError
-    instead and this function can be simplified to match.
+    ExtractionPipeline.run() is a coroutine that concurrently fetches every
+    registered source via asyncio.gather() and raises typed exceptions from
+    core.exceptions instead of calling sys.exit() — the same contract
+    run_newsletter_stage() below already relies on. asyncio.run() bridges
+    the coroutine into Streamlit's synchronous script execution model.
+
+    A single failing source does not fail this stage — ExtractionPipeline
+    only raises ScrapingError if EVERY registered source fails. So reaching
+    any except clause here means the whole extraction layer is down, not
+    just one source; there is no partial-success path to represent.
 
     Scraping failures are always hard failures: without source data, no
     newsletter (live or fallback) is meaningful, so there is no fallback path.
@@ -385,16 +390,26 @@ def run_scraping_stage() -> StageResult:
     try:
         asyncio.run(ExtractionPipeline(output_dir=OUTPUT_DIR).run())
         return StageResult(success=True)
-    except SystemExit: 
+
+    except ScrapingError as exc:
         return StageResult(
             success=False,
             error_message=(
-                "**Scraping failed.** Common causes: network issue, a temporary "
-                "Hacker News outage, or a change in the site's HTML structure."
+                f"**Scraping failed:** `{exc}`\n\n"
+                "Every registered source failed — a network issue, a "
+                "temporary outage, or a change in a source's page structure."
             ),
             show_log_tail=True,
         )
-    except Exception as exc:
+
+    except RepositoryError as exc:
+        return StageResult(
+            success=False,
+            error_message=f"**Data error:** `{exc}`",
+            show_log_tail=True,
+        )
+
+    except BriefingEngineError as exc:
         return StageResult(
             success=False,
             error_message=f"**Unexpected scraping error:** `{exc}`",
@@ -406,8 +421,8 @@ def run_newsletter_stage() -> StageResult:
     """
     Executes Phase 2 (AINewsletterGenerator).
 
-    ai_newsletter.py now raises typed exceptions from core.exceptions instead
-    of calling sys.exit(), so this function catches those directly — no more
+    ai_newsletter.py raises typed exceptions from core.exceptions instead
+    of calling sys.exit(), so this function catches those directly — no
     generic `except SystemExit` / `except Exception`.
 
     Exception routing:
@@ -500,7 +515,7 @@ with st.sidebar:
     st.divider()
 
     st.markdown(
-        "Scrapes the top stories from **Hacker News**, then uses "
+        "Concurrently scrapes top stories from multiple sources, then uses "
         "Google's **Gemini 2.5 Flash** to synthesize them into a polished "
         "editorial briefing — fully automated, end to end. "
         "If the API is under heavy load, the engine seamlessly switches to a "
@@ -508,7 +523,7 @@ with st.sidebar:
     )
     st.markdown(
         "**Pipeline**\n\n"
-        "1. 🔍 Scrape Hacker News top stories\n"
+        "1. 🔍 Scrape sources concurrently (async)\n"
         "2. 🧠 Synthesize with Gemini AI\n"
         "3. 📰 Render as Markdown briefing"
     )
@@ -552,14 +567,14 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 st.title("🧠 AI Tech Briefing Engine")
 st.caption(
-    "Hacker News → Gemini 2.5 Flash → a polished editorial briefing, generated on demand."
+    "Multi-source concurrent scraping → Gemini 2.5 Flash → a polished editorial briefing, generated on demand."
 )
 
 generate_clicked = st.button(
     "🚀 Generate Today's Briefing",
     type="primary",
     use_container_width=True,
-    help="Scrapes the 20 latest Hacker News stories and drafts a fresh AI briefing (~15–30 s).",
+    help="Scrapes the latest stories from every registered source concurrently and drafts a fresh AI briefing (~15–30 s).",
 )
 
 
@@ -574,7 +589,7 @@ if generate_clicked:
 
         # ── Stage 1: Scrape ────────────────────────────────────────────────────
         pipeline_status.write(
-            "🔍 **Stage 1 / 2** — Scraping latest stories from Hacker News..."
+            "🔍 **Stage 1 / 2** — Concurrently scraping latest stories from all registered sources..."
         )
         scrape_result = run_scraping_stage()
 
