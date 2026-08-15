@@ -75,6 +75,7 @@ That typing is what makes graceful degradation possible: `ConfigurationError` an
 | Testing | pytest, pytest-asyncio | Mocked, hermetic tests — zero real network or API calls |
 | Containerization | Docker, Docker Compose | Multi-stage build, non-root runtime, health checks |
 | Configuration | python-dotenv | Cloud-first, local-fallback secret resolution |
+| API Backend | FastAPI, Uvicorn | Enterprise-grade REST API decoupled from UI |
 
 ---
 
@@ -141,6 +142,7 @@ This project isn't "enterprise-grade" because of scale it's been asked to handle
 ```
 .
 ├── app.py                          # Streamlit web UI
+├── api.py                          # FastAPI server exposing the pipeline as a REST API
 ├── smart_data_extractor.py         # ExtractionPipeline + CSVExporter (async, multi-source)
 ├── ai_newsletter.py                # AINewsletterGenerator + Gemini integration
 ├── core/
@@ -168,7 +170,6 @@ This project isn't "enterprise-grade" because of scale it's been asked to handle
 
 ## Roadmap
 
-- **FastAPI backend** exposing the pipeline as a concurrent REST API, decoupled from the Streamlit UI
 - **Live secondary source** — a real OAuth-based Reddit integration replacing the current simulated one
 - **GitHub Actions CI** running the pytest suite on every push
 - **Constructor-injected dependencies** for the orchestrators, so unit tests no longer need to mock at the SDK boundary
